@@ -13,6 +13,9 @@ const PORT = process.env.APP_PORT || process.env.PORT || 3000;
 const FACILITATOR_URL = process.env.FACILITATOR_URL || 'https://x402.org/facilitator';
 const NETWORK = process.env.NETWORK || 'eip155:84532';
 const PRICE = '$0.00025';
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 60);
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60000);
+const rateMap = new Map();
 
 if (!WALLET_ADDRESS) {
   console.error('ERROR: WALLET_ADDRESS environment variable is required');
@@ -22,6 +25,31 @@ if (!WALLET_ADDRESS) {
 const facilitatorClient = new HTTPFacilitatorClient({ url: FACILITATOR_URL });
 const x402Server = new x402ResourceServer(facilitatorClient);
 registerExactEvmScheme(x402Server);
+
+app.use((req, res, next) => {
+  const key = `${req.ip}:${req.path}`;
+  const now = Date.now();
+  const state = rateMap.get(key) || { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+
+  if (now > state.resetAt) {
+    state.count = 0;
+    state.resetAt = now + RATE_LIMIT_WINDOW_MS;
+  }
+
+  state.count += 1;
+  rateMap.set(key, state);
+
+  if (state.count > RATE_LIMIT_MAX) {
+    const retryAfterSec = Math.ceil((state.resetAt - now) / 1000);
+    res.set('Retry-After', String(retryAfterSec));
+    return res.status(429).json({
+      error: 'RATE_LIMITED',
+      message: `Rate limit exceeded. Try again in ${retryAfterSec}s.`
+    });
+  }
+
+  return next();
+});
 
 app.use(paymentMiddleware({
   'POST /api/gas': {
@@ -59,7 +87,13 @@ app.get('/', (req, res) => {
     status: 'online',
     endpoint: 'POST /api/gas',
     example: { chain: 'base' },
-    payment: { price: PRICE, network: NETWORK, protocol: 'x402' }
+    payment: { price: PRICE, network: NETWORK, protocol: 'x402' },
+    model: 'eip1559',
+    cacheTtlMs: Number(process.env.GAS_CACHE_TTL_MS || 10000),
+    rateLimit: {
+      max: RATE_LIMIT_MAX,
+      windowMs: RATE_LIMIT_WINDOW_MS
+    }
   });
 });
 
